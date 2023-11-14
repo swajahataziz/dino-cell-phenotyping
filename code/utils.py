@@ -17,6 +17,9 @@ Misc functions.
 Mostly copy-paste from torchvision references or other public repos like DETR:
 https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
+from cmath import nan
+from email import utils
+
 import os
 import sys
 import time
@@ -33,6 +36,93 @@ import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
 import json
 
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
+import random
+import warnings
+from datetime import timedelta
+warnings.filterwarnings('ignore')
+
+
+def collate_fn(batch):
+    batch = list(filter(lambda x: x is not None, batch))
+    return torch.utils.data.dataloader.default_collate(batch)
+
+
+def check_nan(x):
+    if np.isnan(x).any():
+        return True
+    else:
+        return False
+
+
+def check_zero(x):
+    x_0 = np.where(x == 0)
+    if len(x_0[0]) > 0:
+        print("x_0: {}".format(x_0))
+        return True
+    
+
+def normalize_tensor_per_channel(x):
+    x_min = x.min(axis=(1,2), keepdims=True)
+    x_max = x.max(axis=(1,2), keepdims=True)
+    diff_min_max = x_max - x_min
+    if check_nan(diff_min_max):
+        print("diff_min_max is nan")
+    if check_nan(x-x_min):
+        print("x-x_min is nan:")
+    if check_nan(x):
+        print("x contains nan before normalization")
+    if check_zero(diff_min_max):
+        print("diff_min_max has zero")
+        print("x_max",x_max)
+        print("x_min",x_min)
+        print("diff_min_max",diff_min_max)
+        print("x",x.shape)
+    x = (x - x_min)/(x_max-x_min)
+    if check_nan(x):
+        print("x contains nan after normalization")
+    return x
+
+
+class normalize_tensor_0_to_1(object):
+    def __call__(self, tensor):
+        image = tensor.numpy()
+        image = normalize_tensor_per_channel(image)
+        tensor = torch.from_numpy(image).float()
+        return tensor
+
+
+def normalize_numpy_0_to_1(x):
+    x_min = x.min(axis=(0,1), keepdims=True)
+    x_max = x.max(axis=(0,1), keepdims=True)
+    diff_min_max = x_max - x_min
+    if check_nan(diff_min_max):
+        print("diff_min_max is nan")
+    if check_nan(x-x_min):
+        print("x-x_min is nan:")
+    if check_nan(x):
+        print("x contains nan before normalization")
+    if check_zero(diff_min_max):
+        print("diff_min_max has zero")
+        print("x_max",x_max)
+        print("x_min",x_min)
+        print("diff_min_max",diff_min_max)
+        print("x",x.shape)
+    x = (x - x_min)/(x_max-x_min)
+    if check_nan(x):
+        print("x contains nan after normalization")
+    return x
+
+class NormalizeTensor(object):
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, img_tensor):
+        return torch.stack([transforms.functional.normalize(t, self.mean, self.std) for t in img_tensor])
+
+#Change 8: Custom transforms for Gaussian Blue, adjust brightness and contrast
 class GaussianBlur(object):
     """
     Apply Gaussian Blur to the PIL image.
@@ -53,6 +143,36 @@ class GaussianBlur(object):
             )
         )
 
+class Brightness(object):
+    """
+    Adjust brightness of an image.
+    """
+    def __init__(self, p=0.5, brightness_factor=0.4):
+        self.prob = p
+        self.brightness = brightness_factor
+
+    def __call__(self, img):
+        do_it = random.random() <= self.prob
+        if not do_it:
+            return img
+
+        return TF.adjust_brightness(img, self.brightness)
+
+class Contrast(object):
+    """
+    Adjust contrast of an image.
+    """
+    def __init__(self, p=0.5, contrast_factor=0.4):
+        self.prob = p
+        self.contrast = contrast_factor
+
+    def __call__(self, img):
+        do_it = random.random() <= self.prob
+        if not do_it:
+            return img
+
+        return TF.adjust_contrast(img, self.contrast)
+
 
 class Solarization(object):
     """
@@ -67,6 +187,24 @@ class Solarization(object):
         else:
             return img
 
+
+class AdjustBrightness(object): 
+    def __init__(self, p):
+        self.p = p
+    def __call__(self, x):
+        if random.random() < self.p:
+            for channel in range(x.shape[0]):
+                x[channel] = TF.adjust_brightness(x[channel], random.uniform(0.5,1.25))
+            return x
+        else:
+            return x
+
+class GammaBrightness(object):
+    def __init__(self, gamma_range=(0.7, 1.3)):
+        self.gamma_range = gamma_range
+    def __call__(self, img):
+        gamma = torch.rand(1).uniform_(self.gamma_range[0], self.gamma_range[1])
+        return torch.pow(img, gamma)
 
 def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size):
     if os.path.isfile(pretrained_weights):
@@ -375,12 +513,10 @@ class MetricLogger(object):
                 'data: {data}'
             ])
         MB = 1024.0 * 1024.0
-        
         for obj in iterable:
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
-            '''
             if i % print_freq == 0 or i == len(iterable) - 1:
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
@@ -398,10 +534,8 @@ class MetricLogger(object):
                         time=str(iter_time), data=str(data_time)))
             i += 1
             end = time.time()
-        '''
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('printing total time')
         print('{} Total time: {} ({:.6f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
 
@@ -471,16 +605,16 @@ def setup_for_distributed(is_master):
 
 
 def init_distributed_mode(args):
-    # Change 4: 
+    # Change 6: 
     # launch training with SMDDP 
-    if json.loads(os.environ.get('SM_FRAMEWORK_PARAMS', '{}')).get('sagemaker_distributed_dataparallel_enabled', False): 
-        dist.init_process_group(backend='smddp')
-        args.word_size = dist.get_world_size() 
-        args.gpu = int(os.environ['LOCAL_RANK'])
+    #if json.loads(os.environ.get('SM_FRAMEWORK_PARAMS', '{}')).get('sagemaker_distributed_dataparallel_enabled', False): 
+    #    dist.init_process_group(backend='smddp')
+    #    args.word_size = dist.get_world_size() 
+    #    args.gpu = int(os.environ['LOCAL_RANK'])
         #Change 5: set args.rank
-        args.rank = int(os.environ["RANK"])
+    #    args.rank = int(os.environ["RANK"])
     # launched with torch.distributed.launch
-    elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
@@ -499,14 +633,14 @@ def init_distributed_mode(args):
         print('Does not support training without GPU.')
         sys.exit(1)
         
-    #Change 6: init_process_group called in the first instance already. Dont need to re-reun
+    #Change 7: init_process_group called in the first instance already. Dont need to re-reun
 
-    #dist.init_process_group(
-    #    backend="nccl",
-    #    init_method=args.dist_url,
-    #    world_size=args.world_size,
-    #    rank=args.rank,
-    #)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=args.dist_url,
+        world_size=args.world_size,
+        rank=args.rank,
+    )
 
     torch.cuda.set_device(args.gpu)
     print('| distributed init (rank {}): {}'.format(
