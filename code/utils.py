@@ -206,6 +206,45 @@ class GammaBrightness(object):
         gamma = torch.rand(1).uniform_(self.gamma_range[0], self.gamma_range[1])
         return torch.pow(img, gamma)
 
+def fetch_foldername_of_img_location_donor(dataset, index):
+    img_path = dataset.meta_data.iloc[index]['uri']
+    img_path = img_path.split("/")
+    img_folder_name = img_path[-4]
+    return img_folder_name
+
+def fetch_foldername_of_img_location(dataset, index, folder_depth=0):
+    return dataset.meta_data.iloc[index]['uri'].split("/")[(-folder_depth-2)]
+
+def list_folders_in_directory(directory):
+    return [f.name for f in os.scandir(directory) if f.is_dir() ]
+
+def fetch_all_folder_names_of_folder_depth(dataset, index=1, folder_depth=0):
+    class_names = dataset.dataset.meta_data['phenotype']
+    return class_names
+
+def fetch_class_labels(dataset, index, folder_depth=0):
+    class_name = dataset.iloc[index]['phenotype']
+    return class_name
+
+def get_pretrained_weights_in_chans(pretrained_weights, checkpoint_key="teacher"):
+     if os.path.isfile(pretrained_weights):
+        state_dict = torch.load(pretrained_weights, map_location="cpu")
+        if checkpoint_key is not None and checkpoint_key in state_dict:
+            print(f"Take key {checkpoint_key} in provided checkpoint dict")
+            state_dict_check = state_dict[checkpoint_key]
+            num_in_chans = state_dict_check["backbone.patch_embed.proj.weight"].shape[1]
+        else:
+            try:
+                num_in_chans = state_dict["patch_embed.proj.weight"].shape[1]
+            # print the error of the exception
+            except Exception as e:
+                print(e)
+                print("in_chans not found in checkpoint dict.", state_dict.keys())
+                print("Please provide a checkpoint with in_chans in the state_dict.")
+                print("Exiting...")
+                sys.exit(1)
+        return num_in_chans
+
 def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size):
     if os.path.isfile(pretrained_weights):
         state_dict = torch.load(pretrained_weights, map_location="cpu")
@@ -303,7 +342,12 @@ def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
     # example: {'state_dict': model}
     for key, value in kwargs.items():
         if key in checkpoint and value != None:
+            # print(key)
             try:
+                # Get base model 
+                # model = value['model'] 
+                # Modify patch embedding layer
+                # model.patch_embed.projection = nn.Conv2d(1, 768, kernel_size=8, stride=8)
                 msg = value.load_state_dict(checkpoint[key], strict=False)
                 print("=> loaded '{}' from checkpoint '{}' with msg {}".format(key, ckp_path, msg))
             except TypeError:

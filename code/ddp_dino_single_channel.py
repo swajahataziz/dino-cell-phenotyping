@@ -20,6 +20,7 @@ import math
 import json
 from pathlib import Path
 import os
+from tifffile import imread
 
 import numpy as np
 from PIL import Image
@@ -31,6 +32,7 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
+from torchvision import transforms as T
 from torchvision import models as torchvision_models
 
 import utils
@@ -40,7 +42,7 @@ from vision_transformer import DINOHead
 from dataset import MultichannelDataset
 
 from imgaug import augmenters as iaa
-
+import tifffile
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -181,59 +183,58 @@ def train_dino(args):
     local_root=os.environ["SM_CHANNEL_META"]
     
     
+    channels = [0]
 
-    #Change 3: initialise dataset
-    class PlantDataset(datasets.ImageFolder):
+    class MultiChannelDataset(datasets.ImageFolder):
+        def __getitem__(self, idx):
+            path, target = self.samples[idx]
+            tif = tifffile.TiffFile(path)
+            #image_np= imread(path)
+
+            # Initialize empty array 
+            image = np.empty((tif.pages[0].shape[0], 
+                             tif.pages[0].shape[1],
+                             len(tif.pages)), dtype=float)
+
+            # Loop through TIFF pages (channels) and insert into image array
+            for i, page in enumerate(tif.pages):
+                image[:, :, i] = page.asarray()
+            image_np = image[:,:,selected_channels]
+            '''
+            image_np= imread(path)
+            image_np=image_np.astype(float)
+            image_np = image_np[:,:,selected_channels]
+            '''
+            if args.center_crop:
+                image = torch.from_numpy(image_np).permute(2, 0, 1)
+                transform = transforms.CenterCrop(args.center_crop)
+                image = transform(image)
+                image = image.permute(1, 2, 0)
+                image_np = image.detach().cpu().numpy()
+            image_np = utils.normalize_numpy_0_to_1(image_np)
+            if utils.check_nan(image_np):
+                print("nan in image: ", path)
+                return None
+            else:
+                image = torch.from_numpy(image_np).float().permute(2, 0, 1)
+                if self.transform is not None:
+                    image = self.transform(image)
+                if self.target_transform is not None:
+                    target = self.target_transform(target)
+                return image, idx
     
-        def __init__(self, root, transform=None):
-            super().__init__(root, transform=transform) 
-            
-        def __getitem__(self, index):
-            path, target = self.samples[index]
-            sample = self.loader(path)
-            
-            # Convert PIL image to tensor
-            sample = transforms.functional.to_tensor(sample)
-    
-            # Permute dimensions to PyTorch format
-            #sample = sample.permute(2, 0, 1)
-    
-            if sample.shape[0] != 3:
-                raise ValueError(f'Expected 3 channels, got {sample.shape[0]}')
-    
-            if self.transform is not None:
-                sample = self.transform(sample)
-                
-            return sample, target
 
-    class PlantCellTransforms():
-        
-        def __init__(self, image_size=224): 
-            
-            # Mean and std for normalization 
-            mean = [0.485, 0.456, 0.406]
-            std = [0.229, 0.224, 0.225]
-            
-            # Train transforms
-            self.train_transforms = T.Compose([
-                T.RandomResizedCrop(image_size),
-                T.RandomHorizontalFlip(),
-                T.RandomRotation(30), 
-                T.RandomAffine(15, (0.1, 0.1)),
-                T.Normalize(mean=mean, std=std)
-            ])
-            
-            # Test transforms 
-            self.test_transforms = T.Compose([
-                T.Resize(image_size),
-                T.Normalize(mean=mean, std=std)   
-            ])
+    transform = DataAugmentationDINO(
+            args.images_are_BF,
+            args.global_crops_scale,
+            args.local_crops_scale,
+            args.local_crops_number,
+            mean_for_selected_channel, 
+            std_for_selected_channel,
+            args.center_crop,
+        )    
 
-    transform = PlantCellTransforms()
-
-
-    dataset = PlantDataset(data_dir, 
-                        transform=transform.train_transforms)
+    dataset =  MultiChannelDataset(image_root, transform=transform)
 
     #dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -258,9 +259,9 @@ def train_dino(args):
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
-            in_chans=len(selected_channels)
+            in_chans= 3 #len(selected_channels)
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, in_chans= len(selected_channels))
+        teacher = vits.__dict__[args.arch](patch_size=args.patch_size, in_chans= 3) #len(selected_channels))
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -275,50 +276,6 @@ def train_dino(args):
         embed_dim = student.fc.weight.shape[1]
     else:
         print(f"Unknow architecture: {args.arch}")
-
-    print(f"Initiating Student")
-
-    # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(student, DINOHead(
-        embed_dim,
-        args.out_dim,
-        use_bn=args.use_bn_in_head,
-        norm_last_layer=args.norm_last_layer,
-    ))
-    print(f"Initiating Teacher")
-
-    teacher = utils.MultiCropWrapper(
-        teacher,
-        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
-    )
-    print(f"Moving networks to GPU")
-
-    # move networks to gpu
-    student, teacher = student.cuda(), teacher.cuda()
-    print(f"Synchronizing batch norms")
-    
-    # synchronize batch norms (if any)
-    if utils.has_batchnorms(student):
-        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
-        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
-
-        # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
-        teacher_without_ddp = teacher.module
-    else:
-        # teacher_without_ddp and teacher are the same thing
-        teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
-    # teacher and student start with the same weights
-    print(f"Starting teacher and student with the same weights")
-
-    teacher_without_ddp.load_state_dict(student.module.state_dict())
-    # there is no backpropagation through the teacher, so no need for gradients
-    print(f"Starting teacher and student with the same weights")
-
-    for p in teacher.parameters():
-        p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
@@ -361,9 +318,10 @@ def train_dino(args):
     print(f"Loss, optimizer and schedulers ready.")
 
     # ============ optionally resume training ... ============
+
     to_restore = {"epoch": 0}
     utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
+        os.path.join(args.output_dir, "dino_vitbase16_pretrain_full_checkpoint.pth"),
         run_variables=to_restore,
         student=student,
         teacher=teacher,
@@ -373,6 +331,65 @@ def train_dino(args):
     )
     start_epoch = to_restore["epoch"]
 
+    # Student 
+    #student.patch_embed.projection = nn.Conv2d(len(selected_channels), 768, kernel_size=16, stride=16)
+    student.patch_embed.projection = nn.Conv2d(1, 768, kernel_size=16, stride=16)
+    student.patch_embed.proj = nn.Conv2d(1, 768, kernel_size=16, stride=16)
+    print('Printing student network')
+    print(student)
+
+    # Teacher
+    #teacher.patch_embed.projection = nn.Conv2d(len(selected_channels), 768, kernel_size=16, stride=16)
+    teacher.patch_embed.projection = nn.Conv2d(1, 768, kernel_size=16, stride=16)
+    teacher.patch_embed.proj = nn.Conv2d(1, 768, kernel_size=16, stride=16)
+
+    print(f"Initiating Student")
+
+    # multi-crop wrapper handles forward with inputs of different resolutions
+    student = utils.MultiCropWrapper(student, DINOHead(
+        embed_dim,
+        args.out_dim,
+        use_bn=args.use_bn_in_head,
+        norm_last_layer=args.norm_last_layer,
+    ))
+    print(f"Initiating Teacher")
+
+    teacher = utils.MultiCropWrapper(
+        teacher,
+        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
+    )
+    print(f"Moving networks to GPU")
+
+    # move networks to gpu
+    student, teacher = student.cuda(), teacher.cuda()
+    print(f"Synchronizing batch norms")
+    
+    # synchronize batch norms (if any)
+    if utils.has_batchnorms(student):
+        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
+        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+
+        # we need DDP wrapper to have synchro batch norms working...
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], find_unused_parameters=True)
+        teacher_without_ddp = teacher.module
+    else:
+        # teacher_without_ddp and teacher are the same thing
+        teacher_without_ddp = teacher
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
+    # teacher and student start with the same weights
+    print(f"Starting teacher and student with the same weights")
+
+    teacher_without_ddp.load_state_dict(student.module.state_dict())
+    # there is no backpropagation through the teacher, so no need for gradients
+    print(f"Starting teacher and student with the same weights")
+
+    for p in teacher.parameters():
+        p.requires_grad = False
+    print(f"Student and Teacher are built: they are both {args.arch} network.")
+
+
+    ### Moved checkpoint loading from here
+    
     start_time = time.time()
     print("Starting DINO training !")
     for epoch in range(start_epoch, args.epochs):
@@ -536,58 +553,77 @@ class DINOLoss(nn.Module):
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
+from PIL import ImageOps    
+import random
+
+def solarize(img, threshold=128):
+    return ImageOps.solarize(img, threshold=threshold)
+
+def random_solarize(img, thresholds=(128, 255)):
+    threshold = random.uniform(thresholds[0], thresholds[1])
+    return solarize(img, threshold) 
+    
+solarization = transforms.Lambda(lambda img: random_solarize(img))
+
+# Aggressive color jitter
+color_jitter = T.ColorJitter(0.5, 0, 0.5, 0.3)
+
+# Heavy blur and solarization
+gaussian_blur = T.GaussianBlur(kernel_size=5) 
+
+# Rotation and skew
+rotate = T.RandomRotation(degrees=180)
+affine = T.RandomAffine(degrees=0, shear=15) 
+
+# Global and local crop scales
+global_scale = (0.14, 1.0)
+local_size = 64
 
 class DataAugmentationDINO(object):
     def __init__(self, images_are_BF, global_crops_scale, local_crops_scale, local_crops_number,mean_for_selected_channel,std_for_selected_channel,size):
 
         #Change 5: Apply transformations if only using BrightField channel
         if images_are_BF:
-            flip = transforms.Compose([
+            flip_gamma_brightness = transforms.Compose([
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
+                #utils.AdjustGamma_custom(0.8),
+                #utils.AdjustBrightness(0.8),
             ])
-
-            gamma_brightness = transforms.Compose([
-                utils.GammaBrightness(),
-            ])
-
             normalize = transforms.Compose([
-                utils.normalize_tensor_0_to_1(),
+                # utils.normalize_0_to_1(),
+                transforms.Normalize(mean_for_selected_channel, std_for_selected_channel),
             ])
-
-            brightness = transforms.Compose([
-                utils.Brightness(p=0.8, brightness_factor=0.4),
-            ])
-
-            contrast = transforms.Compose([
-                utils.Contrast(p=0.8, contrast_factor=0.5),
-            ])
-
-            resize = transforms.Resize(size)
 
             # first global crop
             self.global_transfo1 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale),
-                flip,
-                gamma_brightness,
-                brightness,
-                resize,
+                transforms.RandomResizedCrop(224, scale=global_crops_scale), #interpolation=transforms.InterpolationMode.BICUBIC),
+                gaussian_blur, 
+                #solarization,
+                #flip_gamma_brightness,
+                #utils.GaussianBlur_forGreyscaleMultiChan(1.0),
                 normalize,
             ])
             # second global crop
             self.global_transfo2 = transforms.Compose([
-                gamma_brightness,
-                flip,
-                resize,
-                transforms.RandomResizedCrop(224, scale=global_crops_scale), 
+                transforms.RandomResizedCrop(224, scale=global_crops_scale), #interpolation=transforms.InterpolationMode.BICUBIC),
+                affine,
+                rotate,
+                #color_jitter,            
+                #flip_gamma_brightness,
+                #utils.GaussianBlur_forGreyscaleMultiChan(0.1),
+                #utils.Solarization_forGreyscaleMultiChan(0.2),
                 normalize,
             ])
             # transformation for the local small crops
             self.local_crops_number = local_crops_number
             self.local_transfo = transforms.Compose([
-                gamma_brightness,
-                resize,
-                transforms.RandomResizedCrop(224, scale=local_crops_scale), 
+                transforms.RandomResizedCrop(96, scale=local_crops_scale), #interpolation=transforms.InterpolationMode.BICUBIC),
+                gaussian_blur,
+                #color_jitter,
+                rotate,
+                #flip_gamma_brightness,
+                #utils.GaussianBlur_forGreyscaleMultiChan(0.5),
                 normalize,
             ])
 
@@ -660,10 +696,10 @@ if __name__ == '__main__':
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     train_dino(args)
 
-    print("Starting CLS features calc")
-    with open("compute_cls_features.py") as f:
-        exec(f.read())
+    #print("Starting CLS features calc")
+    #with open("compute_cls_features.py") as f:
+    #    exec(f.read())
 
-    print("Starting kNN evaluation")
-    with open("global_kNN.py") as f:
-        exec(f.read())
+    #print("Starting kNN evaluation")
+    #with open("global_kNN.py") as f:
+    #    exec(f.read())

@@ -32,6 +32,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
+import torchvision.transforms as T
 
 import utils
 import vision_transformer as vits
@@ -112,7 +113,7 @@ def get_args_parser():
         choices=['adamw', 'sgd', 'lars'], help="""Type of optimizer. We recommend using adamw with ViTs.""")
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
     #Change: Added new arguments
-    parser.add_argument('--selected_channels', default=[0], nargs='+', help="""list of channel indexes of the .tiff images which should be used to create the tensors.""")
+    parser.add_argument('--selected_channels', default=[0,1,2], nargs='+', help="""list of channel indexes of the .tiff images which should be used to create the tensors.""")
     parser.add_argument('--norm_per_channel_file', default="/fsx/data/output/Dino_training_full_0/mean_and_std_of_dataset.txt", type=str, help="""path to mean and std file in json format""")
     parser.add_argument('--upscale_factor', default=0, type=float, help="""upscale factor to upsample images""")
     parser.add_argument('--center_crop', default=0, type=int, help="""center crop factor to crop images""")
@@ -180,6 +181,11 @@ def train_dino(args):
     image_root=os.environ["SM_CHANNEL_TRAIN"]
     local_root=os.environ["SM_CHANNEL_META"]
     
+    transform = DataAugmentationDINO(
+        args.global_crops_scale,
+        args.local_crops_scale,
+        args.local_crops_number,
+    )    
     
 
     #Change 3: initialise dataset
@@ -193,13 +199,13 @@ def train_dino(args):
             sample = self.loader(path)
             
             # Convert PIL image to tensor
-            sample = transforms.functional.to_tensor(sample)
+            # sample = transforms.functional.to_tensor(sample)
     
             # Permute dimensions to PyTorch format
             #sample = sample.permute(2, 0, 1)
     
-            if sample.shape[0] != 3:
-                raise ValueError(f'Expected 3 channels, got {sample.shape[0]}')
+            #if sample.shape[0] != 3:
+            #    raise ValueError(f'Expected 3 channels, got {sample.shape[0]}')
     
             if self.transform is not None:
                 sample = self.transform(sample)
@@ -229,11 +235,11 @@ def train_dino(args):
                 T.Normalize(mean=mean, std=std)   
             ])
 
-    transform = PlantCellTransforms()
+    #transform = PlantCellTransforms()
 
 
-    dataset = PlantDataset(data_dir, 
-                        transform=transform.train_transforms)
+    dataset = PlantDataset(image_root, 
+                        transform=transform)
 
     #dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -363,7 +369,7 @@ def train_dino(args):
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
     utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
+        os.path.join(args.output_dir, "dino_vitbase16_pretrain_full_checkpoint.pth"),
         run_variables=to_restore,
         student=student,
         teacher=teacher,
@@ -538,119 +544,50 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, images_are_BF, global_crops_scale, local_crops_scale, local_crops_number,mean_for_selected_channel,std_for_selected_channel,size):
-
-        #Change 5: Apply transformations if only using BrightField channel
-        if images_are_BF:
-            flip = transforms.Compose([
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-            ])
-
-            gamma_brightness = transforms.Compose([
-                utils.GammaBrightness(),
-            ])
-
-            normalize = transforms.Compose([
-                utils.normalize_tensor_0_to_1(),
-            ])
-
-            brightness = transforms.Compose([
-                utils.Brightness(p=0.8, brightness_factor=0.4),
-            ])
-
-            contrast = transforms.Compose([
-                utils.Contrast(p=0.8, contrast_factor=0.5),
-            ])
-
-            resize = transforms.Resize(size)
-
-            # first global crop
-            self.global_transfo1 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale),
-                flip,
-                gamma_brightness,
-                brightness,
-                resize,
-                normalize,
-            ])
-            # second global crop
-            self.global_transfo2 = transforms.Compose([
-                gamma_brightness,
-                flip,
-                resize,
-                transforms.RandomResizedCrop(224, scale=global_crops_scale), 
-                normalize,
-            ])
-            # transformation for the local small crops
-            self.local_crops_number = local_crops_number
-            self.local_transfo = transforms.Compose([
-                gamma_brightness,
-                resize,
-                transforms.RandomResizedCrop(224, scale=local_crops_scale), 
-                normalize,
-            ])
-
-        #images are RGB
-        else:
-            flip_and_color_jitter = transforms.Compose([
+    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+        flip_and_color_jitter = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
                 [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
                 p=0.8
             ),
             transforms.RandomGrayscale(p=0.2),
-            ])
-            normalize = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean_for_selected_channel, std_for_selected_channel),
-            ])
+        ])
+        normalize = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ])
 
-            # first global crop
-            self.global_transfo1 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale), #, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_and_color_jitter,
-                utils.GaussianBlur(1.0),
-                normalize,
-            ])
-            # second global crop
-            self.global_transfo2 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale), #, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_and_color_jitter,
-                utils.GaussianBlur(0.1),
-                utils.Solarization(0.2),
-                normalize,
-            ])
-            # transformation for the local small crops
-            self.local_crops_number = local_crops_number
-            self.local_transfo = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=local_crops_scale), #, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_and_color_jitter,
-                utils.GaussianBlur(p=0.5),
-                normalize,
-            ])
+        # first global crop
+        self.global_transfo1 = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            flip_and_color_jitter,
+            utils.GaussianBlur(1.0),
+            normalize,
+        ])
+        # second global crop
+        self.global_transfo2 = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            flip_and_color_jitter,
+            utils.GaussianBlur(0.1),
+            utils.Solarization(0.2),
+            normalize,
+        ])
+        # transformation for the local small crops
+        self.local_crops_number = local_crops_number
+        self.local_transfo = transforms.Compose([
+            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
+            flip_and_color_jitter,
+            utils.GaussianBlur(p=0.5),
+            normalize,
+        ])
 
     def __call__(self, image):
         crops = []
-        #image = self.global_transfo1(image)
-        #image = image[0]
-        #image = image.unsqueeze(0) # add channel dim
-        #crops.append(image)
         crops.append(self.global_transfo1(image))
-        #image = self.global_transfo2(image)
-        #image = image[0]
-        #image = image.unsqueeze(0) # add channel dim
-        #crops.append(image)
         crops.append(self.global_transfo2(image))
         for _ in range(self.local_crops_number):
-            #image = self.local_transfo(image)
-            #image = image[0]
-            #image = image.unsqueeze(0)
-            #crops.append(image)
             crops.append(self.local_transfo(image))
-        for crop in crops:
-            if torch.isnan(crop).any():
-                print("Nan found in the crop")
         return crops
 
 
