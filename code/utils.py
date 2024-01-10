@@ -651,12 +651,12 @@ def setup_for_distributed(is_master):
 def init_distributed_mode(args):
     # Change 6: 
     # launch training with SMDDP 
-    #if json.loads(os.environ.get('SM_FRAMEWORK_PARAMS', '{}')).get('sagemaker_distributed_dataparallel_enabled', False): 
-    #    dist.init_process_group(backend='smddp')
-    #    args.word_size = dist.get_world_size() 
-    #    args.gpu = int(os.environ['LOCAL_RANK'])
+    if json.loads(os.environ.get('SM_FRAMEWORK_PARAMS', '{}')).get('sagemaker_distributed_dataparallel_enabled', False): 
+        dist.init_process_group(backend='smddp')
+        args.word_size = dist.get_world_size() 
+        args.gpu = int(os.environ['LOCAL_RANK'])
         #Change 5: set args.rank
-    #    args.rank = int(os.environ["RANK"])
+        args.rank = int(os.environ["RANK"])
     # launched with torch.distributed.launch
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
@@ -679,12 +679,12 @@ def init_distributed_mode(args):
         
     #Change 7: init_process_group called in the first instance already. Dont need to re-reun
 
-    dist.init_process_group(
-        backend="nccl",
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-    )
+    #dist.init_process_group(
+    #    backend="nccl",
+    #    init_method=args.dist_url,
+    #    world_size=args.world_size,
+    #    rank=args.rank,
+    #)
 
     torch.cuda.set_device(args.gpu)
     print('| distributed init (rank {}): {}'.format(
